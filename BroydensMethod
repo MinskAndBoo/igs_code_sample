@@ -1,0 +1,314 @@
+    public class Broyden
+    {
+        public struct BroydenResult
+        {
+            public double GxNorm;
+            public bool Continue;
+        }
+
+        #region Fields
+        DenseVector _delXn;
+        DenseVector _lastGx;
+        DenseVector _initialX;
+        bool _firstLoop;
+        DenseVector _Jdg;
+        DenseVector _dXJ;
+        DenseVector _deltaGxn;
+        DenseVector _newDeltaX;
+        DenseVector _x;
+        DenseVector _gx;
+        #endregion
+
+        #region Broyden's configuration
+        //Kromuvgrad and Laguna Seca fail without backtracking
+        public const bool UseBacktracking = true;
+        private const int BackTrackingStartIteration = 50;
+        #endregion
+
+        public Broyden(int maxLength)
+        {
+            _delXn = new DenseVector(maxLength);
+            _initialX = new DenseVector(maxLength);
+            _Jdg = new DenseVector(maxLength);
+            _dXJ = new DenseVector(maxLength);
+            _deltaGxn = new DenseVector(maxLength);
+            _lastGx = new DenseVector(maxLength);
+            _newDeltaX = new DenseVector(maxLength);
+            _x = new DenseVector(maxLength);
+            _gx = new DenseVector(maxLength);
+        }
+
+        public BroydenResult BroydenFixedPoint(Action<double[], double[]> f, ref BoundVariable[] boundX, DenseMatrix[] InverseJacobian, int iteration)
+        {
+            _firstLoop = true;
+            double bestGxNorm = Double.MaxValue;
+            double KscaleFactor = 1.0;
+            BroydenResult result;
+
+            // Alias to the correct densematrix in the preconstructed array
+            var i_J = InverseJacobian[boundX.Length - 1];
+            NegativeEye(ref i_J);
+
+            do
+            {
+                result = BroydenFixedPointStep(f, ref boundX, i_J, ref KscaleFactor, iteration);
+                if (result.GxNorm == Double.MaxValue)
+                    // First iteration
+                    continue;
+
+                // Protect against increases in function value
+                if (result.GxNorm > bestGxNorm)
+                    // Reduce distance of X stepping to ensure decrease in function value to reduce Newton-type instability
+                    KscaleFactor *= 0.5;
+                else
+                    bestGxNorm = result.GxNorm;
+            } while (KscaleFactor > 1e-12 && result.Continue); // At 1e-2 KscaleFactor is taken to be at the lower limit of useful x step size
+            return result;
+        }
+
+        private static void NegativeEye(ref DenseMatrix input)
+        {
+            Array.Clear(input.Data, 0, input.Data.Length);
+            // Initialise to negative identity matrix
+            for (int i = 0; i < input.RowCount; i++)
+                input[i, i] = -1.0;
+        }
+
+        private static void Eye(ref DenseMatrix input)
+        {
+            Array.Clear(input.Data, 0, input.Data.Length);
+            // Initialise to negative identity matrix
+            for (int i = 0; i < input.RowCount; i++)
+                input[i, i] = 1.0;
+        }
+
+        /// <summary>
+        /// Evaluate the next iteration of the Broyden method estimate of the fixed point of the given function f, starting at the given initial X.
+        /// </summary>
+        /// <param name="f">The function for which the fixed point is to be found. Must take in a vector of X.Length and return a vector of the same length.</param>
+        /// <param name="lastGx">When called, contains the last function vector (or null for the first evaluation). On return, contains the function result at the given X.</param>
+        /// <param name="X">When called, the point at which to determine the next step. When returns, contains the new X point.</param>
+        /// <param name="initialX">When called, contains the last X (or null for the first evaluation). When returns, contains the initial X point</param>
+        /// <param name="i_J">A reference to a DenseMatrix used for computing the Jacobian</param>
+        public BroydenResult BroydenFixedPointStep(Action<double[], double[]> f, ref BoundVariable[] boundX, DenseMatrix i_J, ref double KscaleFactor, int iteration)
+        {
+            #region Initialisation
+            if (_firstLoop)
+            {
+                _delXn.Clear();
+                _initialX.Clear();
+                _Jdg.Clear();
+                _dXJ.Clear();
+                _deltaGxn.Clear();
+                _lastGx.Clear();
+                _newDeltaX.Clear();
+                _x.Clear();
+                _gx.Clear();
+            }
+
+            // N is the number of elements to operate on in each of the vector and matrix operations
+            int N = boundX.Length;
+
+            for (int i = 0; i < boundX.Length; i++)
+                _x[i] = boundX[i].ScaledBoundValue;
+
+            if (f == null) throw new ArgumentNullException();
+            #endregion
+
+            // Evaluate delta Xn from the last iteration
+            //delXn = x - initialX
+            _x.CopyToPartial(_delXn, N);
+            _delXn.SubtractInPlace(_initialX);
+            // initialX = x
+            _x.CopyToPartial(_initialX, N);
+
+            // g(x) = f(x) - x, where we are seeking g(x) = 0
+            var gx = GetGx(f, _x, boundX);
+
+            BroydenResult result = new BroydenResult();
+            result.GxNorm = gx.Norm(2);
+            CheckIsNaN(gx.Data);
+            if (_firstLoop)
+            {
+                _firstLoop = false;
+                // Copy g(x)
+                gx.CopyToPartial(_lastGx, N);
+                // Update X
+                i_J.Multiply(gx, _newDeltaX);
+                _x.SubtractInPlace(_newDeltaX);
+                for (int i = 0; i < boundX.Length; i++)
+                    boundX[i].ScaledBoundValue = _x.Data[i];
+
+                result.Continue = true;
+                result.GxNorm = Double.MaxValue;
+                return result;
+            }
+
+            //deltaGxn = gx - _lastGx;
+            gx.CopyToPartial(_deltaGxn, N);
+            _deltaGxn.SubtractInPlace(_lastGx);
+
+            // Copy
+            gx.CopyToPartial(_lastGx, N);
+
+            if (_deltaGxn.Sum() == 0.0)
+            {
+                result.Continue = false;
+                result.GxNorm = 0;
+                return result;
+            }
+
+            // Compute and apply the inverse Jacobian update
+            UpdateIJacobian(ref i_J, _delXn, _deltaGxn);
+
+            if (Double.IsNaN(i_J.L1Norm()))
+                Array.Clear(i_J.Data, 0, i_J.Data.Length);
+            //throw new Exception("Jacobian update yielded NaNs");
+
+            // Find the new movement vector deltaX
+            //var newDeltaX = i_J * gx;
+            i_J.Multiply(gx, _newDeltaX);
+
+            // In debug, check for NaN
+            CheckIsNaN(gx.Data);
+
+            // Termination flag
+            result.Continue = true;
+
+            // Scale the deltaX vector if necessary to satisfy bounds conditions
+            bool deltaXGoesOutOfBounds;
+
+            do
+            {
+                // Check out of bounds
+                deltaXGoesOutOfBounds = OutOfBounds(_initialX, _newDeltaX, boundX);
+
+                if (deltaXGoesOutOfBounds)
+                {
+                    // Scale down by a half
+                    _newDeltaX.MultiplyInPlace(0.5);
+                    // Record the change
+                    KscaleFactor *= 0.5;
+                }
+
+                // X movement is on the order of machine precision, complete
+                result.Continue = _newDeltaX.Norm(2) > 3e-16;
+            } while (deltaXGoesOutOfBounds && result.Continue);
+
+            #region Backtracking
+            // Start backtracking if it's a difficult system
+            if (iteration > BackTrackingStartIteration && UseBacktracking)
+            {
+                bool terminateBoundsSearch = false;
+                double lastDist = Double.MaxValue;
+                int j = 0;
+                const double scaleFactor = 0.9;
+                // Backtracking to improve solution
+                if (result.Continue)
+                    do
+                    {
+                        var distance = GetGx(f, _initialX - _newDeltaX, boundX).Norm();
+                        if (distance < lastDist)
+                        {
+                            // A better solution was found (forced on the first iteration)
+                            lastDist = distance;
+                            _newDeltaX.MultiplyInPlace(scaleFactor);
+                        }
+                        else
+                        {
+                            // Go back to last solution and terminate
+                            _newDeltaX.MultiplyInPlace(1.0 / scaleFactor);
+                            terminateBoundsSearch = true;
+                        }
+                        j++;
+                    } while (!terminateBoundsSearch && j < 10);
+            }
+            #endregion
+
+            // Apply the change if the move did not go out of bounds
+            // Write X to the bound variable structure
+            for (int i = 0; i < boundX.Length; i++)
+            {
+                // Calculate and write the final X
+                //x = initialX - newDeltaX;
+                _initialX.CopyToPartial(_x, N);
+                _x.SubtractInPlace(_newDeltaX);
+                boundX[i].ScaledBoundValue = _x.Data[i];
+            }
+
+            // Check conditions for continuing
+            result.Continue = (_newDeltaX.Norm(2) > 3e-16) && (_gx.Norm(2) > 3e-16);
+
+            return result;
+            // lastX, X and lastGx have been assigned, return
+        }
+
+        /// <summary>
+        /// Tests whether the initial point minus the testVector goes out of bounds. Check signs
+        /// </summary>
+        /// <param name="initialPoint"></param>
+        /// <param name="testVector"></param>
+        /// <param name="bounds"></param>
+        /// <returns></returns>
+        private bool OutOfBounds(DenseVector initialPoint, DenseVector testVector, BoundVariable[] bounds)
+        {
+            for (int i = 0; i < bounds.Length; i++)
+                if (bounds[i].IsOutOfBounds(initialPoint[i] - testVector[i]))
+                    return true;
+            return false;
+        }
+
+        private void UpdateIJacobian(ref DenseMatrix i_J, DenseVector delXn, DenseVector deltaGxn)
+        {
+            if (_Jdg == null || _Jdg.Length < i_J.RowCount)
+                _Jdg = new DenseVector(i_J.RowCount);
+            if (_dXJ == null || _dXJ.Length < i_J.RowCount)
+                _dXJ = new DenseVector(i_J.RowCount);
+
+            i_J.Multiply(deltaGxn, _Jdg);
+            var dXnJdg = 0.0;
+            for (int i = 0; i < Math.Min(_Jdg.Length, delXn.Length); i++)
+                dXnJdg += delXn[i] * _Jdg[i];
+
+            for (int i = 0; i < Math.Min(_Jdg.Length, delXn.Length); i++)
+                _Jdg[i] = (delXn[i] - _Jdg[i]) / dXnJdg;
+
+            //double dXnJdg = delXn * _Jdg;
+
+            //for (int i = 0; i < _Jdg.Length; i++)
+            //    _Jdg[i] = (delXn[i] - _Jdg[i]) / dXnJdg;
+
+            i_J.LeftMultiply(delXn, _dXJ);
+
+            _Jdg.CustomTransposeMultiplyAndAdd(_dXJ, i_J);
+        }
+
+        private DenseVector GetGx(Action<double[], double[]> f, DenseVector x, BoundVariable[] boundX)
+        {
+            // g(x) = f(x) - x, where we are seeking g(x) = 0
+            f(x.Data, _gx.Data);
+            //var gx = new DenseVector(f(x.Data));
+
+            // Use the bounded structure for convenient transformation of gx
+            for (int i = 0; i < boundX.Length; i++)
+                boundX[i].Value = _gx.Data[i];
+            // And bring it back out again transformed
+            for (int i = 0; i < boundX.Length; i++)
+                _gx.Data[i] = boundX[i].ScaledBoundValue;
+
+            _gx.SubtractInPlace(x); // Subtract x from g(x) in place
+            return new DenseVector(_gx);
+        }
+
+        /// <summary>
+        /// Checks if the value is not number
+        /// </summary>
+        /// <param name="value"></param>
+        [Conditional("DEBUG")]
+        public static void CheckIsNaN(double[] value)
+        {
+            for (int i = 0; i < value.Length; i++)
+                if (Double.IsNaN(value[i]) || Double.IsInfinity(value[i]))
+                    throw new Exception("Result is not valid");
+        }
+    }
